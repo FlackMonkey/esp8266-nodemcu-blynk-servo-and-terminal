@@ -1,9 +1,15 @@
 
+
+
+
+
 /* Comment this out to disable prints and save space */
 #define BLYNK_PRINT Serial
 #include <FS.h>
 #include <ESP8266WiFi.h>
 #include <BlynkSimpleEsp8266.h>
+
+
 
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
@@ -17,8 +23,8 @@ Servo servo_L_K;
 
 WidgetLED led1(V4);
 
-#define servo_L_B_PIN D2
-#define servo_L_K_PIN D3
+#define servo_L_B_PIN D7
+#define servo_L_K_PIN D8
 
 bool distance_m_on = false;
 #define distance_m_trig_pin D5
@@ -33,6 +39,13 @@ int servo_L_B_angle = 90;
 
 int servo_L_K_RAW = 1023 / 2;
 int servo_L_K_angle = 90;
+
+int PIR_MOTION_DETECTION_PIN = 5; // Input for HC-S501, GPIO15 / D5
+int PIR_MOTION_DETECTION_VALUE = 0;
+int PIR_MOTION_DETECTION_PIN_TO_VIRTUAL_PIN = 0; //0-4
+bool PIR_MOTION_DETECTION_ON = true;
+
+int DIGITAL_TO_VIRTUAL_PINS_VALUES[5] = {0, 0, 0, 0, 0};
 
 int led_state = LOW;
 
@@ -49,19 +62,105 @@ bool shouldSaveConfig = false;
 bool configLoaded = false;
 //callback notifying us of the need to save config
 
+String COMMAND_DISTANCE_METER = "distance meter trig";
+String COMMAND_SHIFTOUT_SET_VALUE = "shiftout";
+String COMMAND_CONFIG_RESET = "cfg rst now";
 
 String latestMessage = "";
 
 // Attach virtual serial terminal to Virtual Pin V1
 WidgetTerminal terminal(V9);
-
-
 //
 
-void terminal_show_instructions(){
+////------------------------------------------------------------
+//#include <Wire.h>
+//#include <Adafruit_PWMServoDriver.h>
+//
+//// called this way, it uses the default address 0x40
+//Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+//// you can also call it with a different address you want
+////Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x41);
+//// you can also call it with a different address and I2C interface
+////Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(&Wire, 0x40);
+////------------------------------------------------------------
+//// Depending on your servo make, the pulse width min and max may vary, you
+//// want these to be as small/large as possible without hitting the hard stop
+//// for max range. You'll have to tweak them as necessary to match the servos you
+//// have!
+//#define SERVOMIN  150 // this is the 'minimum' pulse length count (out of 4096)
+//#define SERVOMAX  600 // this is the 'maximum' pulse length count (out of 4096)
+//
+//// our servo # counter
+//uint8_t servonum = 0;
+
+////------------------------------------------------------------
+#include <Wire.h>
+#include <servo_PCA9685.h>
+
+#define MAX_SERVOS  16
+/*
+   ESP8266 I2C - pins
+   SDA: 4 - D2
+   SCL: 5 - D1
+*/
+servo_PCA9685 theServo_PCA9685  = servo_PCA9685();
+
+int valz_PCA9685[16] = {
+  0, 0, 0, 0
+  , 0, 0, 0, 0
+  , 0, 0, 0, 0
+  , 0, 0, 0, 0
+};
+uint8_t servonum = 0;
+////------------------------------------------------------------
+
+
+#define MIN_PULSE_WIDTH       650
+#define MAX_PULSE_WIDTH       2350
+#define DEFAULT_PULSE_WIDTH   1500
+#define FREQUENCY             50
+
+// you can use this function if you'd like to set the pulse length in seconds
+// e.g. setServoPulse(0, 0.001) is a ~1 millisecond pulse width. its not precise!
+//void setServoPulse(uint8_t n, double pulse) {
+//  double pulselength;
+//
+//  pulselength = 1000000;   // 1,000,000 us per second
+//  pulselength /= 60;   // 60 Hz
+//  Serial.print(pulselength); Serial.println(" us per period");
+//  pulselength /= 4096;  // 12 bits of resolution
+//  Serial.print(pulselength); Serial.println(" us per bit");
+//  pulse *= 1000000;  // convert to us
+//  pulse /= pulselength;
+//  Serial.println(pulse);
+//  pwm.setPWM(n, 0, pulse);
+//}
+//------------------------------------------------------------
+
+
+
+
+#include <LedMatrix.h> //https://github.com/squix78/MAX7219LedMatrix
+
+bool ledMatrix_on = false;
+//LedMatrix ledMatrix;
+//= LedMatrix(1, 2);
+
+//------------------------------------------------------------
+bool shiftRegister_ON = false;
+int shiftRegister_pin_latch[2] =  {2, 5};
+int shiftRegister_pin_clock[2] =  {3, 6};
+int shiftRegister_pin_data[2] = {4, 7};
+int shiftRegister_value[2] = {5, 5};
+//------------------------------------------------------------
+
+
+void terminal_show_instructions() {
   terminal.println("Available commands:");
-  terminal.println(" cfg rst now - will do blynk token reset");
-  terminal.println(" distance meter trig - will on/off distancee tracking on D5(trig), D6(echo) V10-V11");
+  String indent = " ";
+  terminal.println(indent + COMMAND_CONFIG_RESET + " - will do blynk token reset");
+  terminal.println(indent + COMMAND_DISTANCE_METER + " - will on/off distancee tracking on D5(trig), D6(echo) V10-V11");
+  terminal.println(indent + COMMAND_SHIFTOUT_SET_VALUE + " X V - will set shiftout register number X to value V");
   terminal.println("Extra pins:");
   terminal.println("servo_L_B_PIN D2 - VO write, v1 read");
   terminal.println("servo_L_K_PIN D3 - v3 write, v2 read");
@@ -145,10 +244,10 @@ bool stringStartsWithSequence(String source, String mayBeAPart) {
 }
 
 bool commandContainsResetSequence(String str) {
-  return stringStartsWithSequence(str, "cfg rst now");
+  return stringStartsWithSequence(str, COMMAND_CONFIG_RESET);
 }
 bool commandContainsDistanceMeterTriggerSequence(String str) {
-  return stringStartsWithSequence(str, "distance meter trig");
+  return stringStartsWithSequence(str, COMMAND_DISTANCE_METER);
 }
 
 
@@ -166,22 +265,34 @@ BLYNK_WRITE(V9)
   Serial.println("|||");
   bool doReset = commandContainsResetSequence(String(param.asStr()));
   bool distanceMeterTrigger = commandContainsDistanceMeterTriggerSequence(String(param.asStr()));
+  bool hasShiftoutUpdate = stringStartsWithSequence(String(param.asStr()), COMMAND_SHIFTOUT_SET_VALUE);
   if (doReset) {
     terminal.print("Will reset device");
   }
 
-
-
+  if (hasShiftoutUpdate) {
+    /*
+      char* command = strtok(param.asStr(), " ");
+      int argIDx = 0;
+      while (command != 0) {
+      terminal.println(" argumnent ");
+      terminal.print(argIDx);
+      terminal.print(command);
+      termnial.println("");
+      argIDx++;
+      }
+    */
+  }
   if (distanceMeterTrigger) {
     terminal.print("Will trigger (on<->off) distance meter");
     distance_m_on = !distance_m_on;
-    configBoolUpdate("distance_meter_on",distance_m_on);
+    configBoolUpdate("distance_meter_on", distance_m_on);
   }
 
-  if (stringStartsWithSequence(String(param.asStr()),"help")){
+  if (stringStartsWithSequence(String(param.asStr()), "help")) {
     terminal_show_instructions();
   }
-  
+
   // Ensure everything is sent
   terminal.flush();
 
@@ -226,6 +337,41 @@ BLYNK_READ(V5)
 
 BLYNK_READ(V11) {
   Blynk.virtualWrite(V11, distance_m_distance);
+}
+//-----------------------------------------
+BLYNK_WRITE(V20) {
+  valz_PCA9685[0] = param.asInt();
+}
+BLYNK_READ(V20) {
+  Blynk.virtualWrite(V20, valz_PCA9685[0]);
+}
+
+BLYNK_WRITE(V21) {
+  valz_PCA9685[1] = param.asInt();
+}
+BLYNK_READ(V21) {
+  Blynk.virtualWrite(V21, valz_PCA9685[1]);
+}
+
+BLYNK_WRITE(V22) {
+  valz_PCA9685[2] = param.asInt();
+}
+BLYNK_READ(V22) {
+  Blynk.virtualWrite(V22, valz_PCA9685[2]);
+}
+
+BLYNK_WRITE(V23) {
+  valz_PCA9685[3] = param.asInt();
+}
+BLYNK_READ(V23) {
+  Blynk.virtualWrite(V23, valz_PCA9685[3]);
+}
+
+BLYNK_WRITE(V24) {
+  valz_PCA9685[4] = param.asInt();
+}
+BLYNK_READ(V24) {
+  Blynk.virtualWrite(V24, valz_PCA9685[4]);
 }
 //-----------------------------------------
 
@@ -477,6 +623,45 @@ void setup()
   pinMode(distance_m_trig_pin, OUTPUT);
   pinMode(distance_m_echoPin, INPUT);
   terminal_show_instructions();
+
+  pinMode(PIR_MOTION_DETECTION_PIN, INPUT);
+
+
+  //----------------------------------------------------------
+  //pwm.begin();
+  //pwm.setPWMFreq(60);  // Analog servos run at ~60 Hz updates
+
+  //pwm.begin();
+  //pwm.setPWMFreq(FREQUENCY);
+  //----------------------------------------------------------
+
+  //----------------------------------------------------------
+  theServo_PCA9685.begin();
+  //----------------------------------------------------------
+
+
+  //----------------------------------------------------------
+  if (ledMatrix_on) {
+    int ledMatrix_pin = 2;
+    int ledMatrixCount = 1;
+    /*
+    ledMatrix = LedMatrix(ledMatrixCount, ledMatrix_pin);
+    ledMatrix.init();
+    ledMatrix.setIntensity(4); // range is 0-15
+    ledMatrix.setText("MAX7219 Demo");
+    */
+  }
+  //----------------------------------------------------------
+
+}
+
+int pulseWidth(int angle)
+{
+  int pulse_wide, analog_value;
+  pulse_wide   = map(angle, 0, 180, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH);
+  analog_value = int(float(pulse_wide) / 1000000 * FREQUENCY * 4096);
+  Serial.println(analog_value);
+  return analog_value;
 }
 
 
@@ -487,36 +672,39 @@ void mapValueAndWriteServo(int raw, int angle, Servo servo) {
 }
 
 void loop_distance_measure() {
-  // Clears the distance_m_trig_pin
-  digitalWrite(distance_m_trig_pin, LOW);
-  delayMicroseconds(2);
 
-  // Sets the distance_m_trig_pin on HIGH state for 10 micro seconds
-  digitalWrite(distance_m_trig_pin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(distance_m_trig_pin, LOW);
+  if (distance_m_on) {
+    // Clears the distance_m_trig_pin
+    digitalWrite(distance_m_trig_pin, LOW);
+    delayMicroseconds(2);
 
-  // Reads the distance_m_echoPin, returns the sound wave travel time in microseconds
-  distance_m_duration = pulseIn(distance_m_echoPin, HIGH);
+    // Sets the distance_m_trig_pin on HIGH state for 10 micro seconds
+    digitalWrite(distance_m_trig_pin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(distance_m_trig_pin, LOW);
 
-  // Calculating the distance
-  distance_m_distance = distance_m_duration * 0.034 / 2;
+    // Reads the distance_m_echoPin, returns the sound wave travel time in microseconds
+    distance_m_duration = pulseIn(distance_m_echoPin, HIGH);
 
-  int theTime = millis();
+    // Calculating the distance
+    distance_m_distance = distance_m_duration * 0.034 / 2;
 
-  // Prints the distance on the Serial Monitor
-  Serial.print("Distance: ");
-  Serial.print(distance_m_distance);
-  Serial.print(" time: ");
-  Serial.println(theTime);
+    int theTime = millis();
 
-  terminal.print("Distance (sm): ");
-  terminal.print(distance_m_distance);
-  terminal.print(" time: ");
-  terminal.println(theTime);
-  terminal.flush();
+    // Prints the distance on the Serial Monitor
+    Serial.print("Distance: ");
+    Serial.print(distance_m_distance);
+    Serial.print(" time: ");
+    Serial.println(theTime);
 
-  delay(1000);
+    terminal.print("Distance (sm): ");
+    terminal.print(distance_m_distance);
+    terminal.print(" time: ");
+    terminal.println(theTime);
+    terminal.flush();
+
+    delay(1000);
+  }
 }
 
 void loop_serial_msg() {
@@ -533,23 +721,29 @@ void loop_serial_msg() {
   }
 }
 
-void loop()
-{
-  ArduinoOTA.handle();
-  Blynk.run();
-
-
-  loop_servo_move();
-
-  if (distance_m_on) {
-    loop_distance_measure();
-  }
-
-  loop_serial_msg();
-
-
-
+int digital_pin_value(int pinNumber) {
+  return digitalRead(pinNumber);
 }
+
+void virtual_pin_value_set(int vPinIdx, int value) {
+  DIGITAL_TO_VIRTUAL_PINS_VALUES[vPinIdx] = value;
+}
+void loop_pir_motion_detection() {
+  if (PIR_MOTION_DETECTION_ON) {
+    PIR_MOTION_DETECTION_VALUE = digital_pin_value(PIR_MOTION_DETECTION_PIN);
+
+    virtual_pin_value_set(PIR_MOTION_DETECTION_PIN_TO_VIRTUAL_PIN, PIR_MOTION_DETECTION_VALUE);
+  }
+}
+
+void loop_servo_PCA_9685() {
+  for (uint16_t servoIdx = 0; servoIdx < 4; servoIdx++) {
+    theServo_PCA9685.setPWM(servoIdx, 0, valz_PCA9685[servoIdx]);
+    delay(50);
+  }
+}
+
+
 
 void loop_servo_move() {
   //  mapValueAndWriteServo(servo_L_B_RAW,servo_L_B_angle,servo_L_B);
@@ -562,4 +756,50 @@ void loop_servo_move() {
   servo_L_K.write(servo_L_K_angle);
   //  digitalWrite(led_PIN, led_state);
   delay(50);
+}
+
+void sendBitsToShift(int idx, byte value) {
+  digitalWrite(shiftRegister_pin_latch[idx], LOW);
+  shiftOut(shiftRegister_pin_data[idx], shiftRegister_pin_clock[idx], MSBFIRST, value);
+  digitalWrite(shiftRegister_pin_latch[idx], HIGH);
+}
+void loop_led_matrix() {
+  if (ledMatrix_on) {
+    /*
+    ledMatrix.clear();
+    ledMatrix.scrollTextLeft();
+    ledMatrix.drawText();
+    ledMatrix.commit(); // commit transfers the byte buffer to the displays
+    delay(200);
+    */
+  }
+}
+
+void loop_shift_register() {
+  if (shiftRegister_ON) {
+    for (int i = 0; i < 2; i++) {
+      sendBitsToShift(i, shiftRegister_value[i]);
+    }
+  }
+
+}
+
+
+void loop()
+{
+  ArduinoOTA.handle();
+  Blynk.run();
+
+  loop_servo_move();
+  loop_distance_measure();
+  loop_pir_motion_detection();
+  loop_servo_PCA_9685();
+
+  loop_shift_register();
+  loop_led_matrix();
+
+  loop_serial_msg();
+
+
+
 }
